@@ -5,12 +5,16 @@
 
 [CmdletBinding()]
 param(
+    [switch]$ResetInsider,
     [switch]$SkipInsiderReset
 )
 
 $ErrorActionPreference = "Continue"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $backupRoot = Join-Path $env:SystemDrive "WU_Repair_Backup_$timestamp"
+if (-not $ResetInsider -and -not $SkipInsiderReset) {
+    $SkipInsiderReset = $true
+}
 
 function Write-Section {
     param([string]$Text)
@@ -51,6 +55,17 @@ $services = @(
     "msiserver"
 )
 
+$originalStartupModes = @{}
+foreach ($svc in $services) {
+    try {
+        $service = Get-Service -Name $svc -ErrorAction Stop
+        $originalStartupModes[$svc] = $service.StartType
+    }
+    catch {
+        $originalStartupModes[$svc] = $null
+    }
+}
+
 foreach ($svc in $services) {
     try {
         Stop-Service -Name $svc -Force -ErrorAction Stop
@@ -80,11 +95,11 @@ foreach ($item in $cacheItems) {
         $destination = Join-Path $backupRoot $item.BackupName
 
         try {
-            Rename-Item -Path $item.Path -NewName $item.BackupName -ErrorAction Stop
-            Write-Host "[OK] Renamed: $($item.Path)" -ForegroundColor Green
+            Move-Item -Path $item.Path -Destination $destination -ErrorAction Stop
+            Write-Host "[OK] Moved backup: $($item.Path) -> $destination" -ForegroundColor Green
         }
         catch {
-            Write-Host "[WARN] Could not rename: $($item.Path)" -ForegroundColor Yellow
+            Write-Host "[WARN] Could not move: $($item.Path)" -ForegroundColor Yellow
             Write-Host "       $($_.Exception.Message)" -ForegroundColor DarkYellow
         }
     }
@@ -188,15 +203,19 @@ foreach ($dll in $dlls) {
     if (Test-Path $path) {
         $process = Start-Process -FilePath $regsvr32 `
             -ArgumentList "/s `"$path`"" `
-            -Wait `
             -PassThru `
             -WindowStyle Hidden
-
-        if ($process.ExitCode -eq 0) {
-            Write-Host "[OK] Registered: $dll" -ForegroundColor Green
+        if (-not $process.WaitForExit(10000)) {
+            try { $process.Kill() } catch {}
+            Write-Host "[WARN] Timeout registering: $dll" -ForegroundColor Yellow
         }
         else {
-            Write-Host "[WARN] regsvr32 exit code $($process.ExitCode): $dll" -ForegroundColor Yellow
+            if ($process.ExitCode -eq 0) {
+                Write-Host "[OK] Registered: $dll" -ForegroundColor Green
+            }
+            else {
+                Write-Host "[WARN] regsvr32 exit code $($process.ExitCode): $dll" -ForegroundColor Yellow
+            }
         }
     }
     else {
@@ -206,12 +225,8 @@ foreach ($dll in $dlls) {
 
 # ------------------------------------------------------------
 # 6. Reset Windows Insider configuration
-#    The default target is the current Canary branch format:
-#    CanaryChannel / Mainline / External.
-#
-#    The registry is exported before modification.
-#    Use -SkipInsiderReset to perform only the Windows Update
-#    component reset.
+#    This section is opt-in. Use -ResetInsider to set the Canary
+#    Mainline / External enrollment format after exporting the key.
 # ------------------------------------------------------------
 if (-not $SkipInsiderReset) {
     Write-Section "6. Reset Windows Insider configuration"
@@ -275,21 +290,16 @@ else {
 # ------------------------------------------------------------
 Write-Section "7. Restore Windows Update service startup modes"
 
-$startupModes = @{
-    "wuauserv" = "Manual"
-    "bits"     = "Manual"
-    "cryptsvc" = "Automatic"
-    "dosvc"    = "Manual"
-    "msiserver" = "Manual"
-}
-
-foreach ($svc in $startupModes.Keys) {
-    try {
-        Set-Service -Name $svc -StartupType $startupModes[$svc] -ErrorAction Stop
-        Write-Host "[OK] $svc -> $($startupModes[$svc])" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "[WARN] Could not set startup type for $svc" -ForegroundColor Yellow
+foreach ($svc in $services) {
+    $startupType = $originalStartupModes[$svc]
+    if ($null -ne $startupType) {
+        try {
+            Set-Service -Name $svc -StartupType $startupType -ErrorAction Stop
+            Write-Host "[OK] $svc -> $startupType" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "[WARN] Could not restore startup type for $svc" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -339,7 +349,9 @@ Write-Host "Recommended next step:" -ForegroundColor Yellow
 Write-Host "1. Restart Windows." -ForegroundColor White
 Write-Host "2. Open Settings -> Windows Update." -ForegroundColor White
 Write-Host "3. Check for updates." -ForegroundColor White
-Write-Host "4. If you use Windows Insider, verify the Insider channel after reboot." -ForegroundColor White
+if (-not $SkipInsiderReset) {
+    Write-Host "4. If you used -ResetInsider, verify the Insider channel after reboot." -ForegroundColor White
+}
 Write-Host ""
 Write-Host "To repair Windows Update without changing Insider registry settings:" -ForegroundColor Gray
-Write-Host "    .\WIN11_REPAIR_WU_WI.ps1 -SkipInsiderReset" -ForegroundColor Gray
+Write-Host "    .\WIN11_REPAIR_WU_V1b.ps1 -SkipInsiderReset" -ForegroundColor Gray
